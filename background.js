@@ -555,11 +555,27 @@ async function listSuggestionEnabledSources(config) {
   return sources
 }
 
-async function safeListSources(label, config) {
+async function listAllSources(config) {
+  const result = await callBatchExecute('YqkSHd', [null, 'source_status=SOURCE_STATUS_ACTIVE'], config)
+  if (!result?.[0]) return []
+  const arr = result[0]
+  const sources = []
+  for (let i = 0; i < arr.length; i++) {
+    const row = arr[i]
+    if (typeof row?.[SOURCE.ID] === 'string' && row[SOURCE.ID].startsWith('github/')) {
+      sources.push(row[SOURCE.ID])
+    }
+  }
+  return sources
+}
+
+async function safeListSources(label, config, allowAll = false) {
   try {
-    const repos = await listSuggestionEnabledSources(config)
+    const repos = allowAll
+      ? await listAllSources(config)
+      : await listSuggestionEnabledSources(config)
     if (repos.length === 0) {
-      addLog(`[${label}] No repos have Suggestions enabled. Nothing to do.`)
+      addLog(`[${label}] No repos found. Nothing to do.`)
       return null
     }
     return repos
@@ -1283,7 +1299,8 @@ function initOperationState(options) {
     progress: { archived: 0, skipped: 0, total: 0 },
     results: [],
     log: [],
-    error: null
+    error: null,
+    options: { ...options }
   })
 
   const modeHeader = options.dryRun
@@ -1292,6 +1309,8 @@ function initOperationState(options) {
       ? '=== SUGGESTIONS MODE ==='
       : options.opMode === 'remove_suggestions'
         ? '=== REMOVE SUGGESTIONS MODE ==='
+        : options.opMode === 'export_suggestions'
+          ? '=== EXPORT SUGGESTIONS JSON MODE ==='
         : '=== ARCHIVE MODE ==='
   addLog(modeHeader)
   if (!options.opMode || options.opMode === 'archive') {
@@ -1299,6 +1318,201 @@ function initOperationState(options) {
   }
   addLog('=== v2: batchexecute API ===')
   return options.opMode === 'suggestions'
+}
+
+
+
+function buildBatchAgentPrompt(suggestions, repo) {
+  const repoName = repo.replace(/^github\//, '')
+  let body = `# Code Review & Health Remediation Plan for ${repoName}\n\n`
+  body += `You are an elite principal engineer and code review agent (like CodeRabbit). `
+  body += `You have been provided with an audited list of ${suggestions.length} suggestions identified across this codebase.\n\n`
+  body += `## CRITICAL OPERATING INSTRUCTIONS:\n`
+  body += `1. **AWARENESS OF CODE CHANGES**: The code in the repository may have evolved since these suggestions were generated. `
+  body += `Before making any modifications, inspect the current state of each targeted file and line. If a suggestion is already resolved, obsolete, or invalid given recent refactorings, skip it and clearly state why in your notes.\n`
+  body += `2. **SYSTEMATIC SEQUENTIAL EXECUTION**: Work through the items sequentially, one by one. Do not rush or batch untested changes across unrelated files.\n`
+  body += `3. **PRESERVE ARCHITECTURAL INTEGRITY**: Maintain type safety, multiplatform boundaries (if applicable), and ensure no behavioral regressions are introduced.\n`
+  body += `4. **VERIFICATION**: Run local Gradle/build checks and relevant tests to verify each fix before moving on to the next item.\n\n`
+  body += `## AUDITED SUGGESTIONS CHECKLIST (${suggestions.length} items):\n\n`
+
+  suggestions.forEach((s, idx) => {
+    body += `### Item ${idx + 1}: [${s.categorySlug || 'FIX'}] ${s.title}\n`
+    body += `- **Location:** \`${s.filePath}:${s.line}\`\n`
+    if (s.description) body += `- **Description:** ${s.description}\n`
+    if (s.rationale && s.rationale !== 'N/A') body += `- **Rationale:** ${s.rationale}\n`
+    if (s.codeSnippet) {
+      body += `\n\`\`\`${s.language || 'text'}\n${s.codeSnippet.trim()}\n\`\`\`\n`
+    }
+    body += `\n---\n\n`
+  })
+
+  body += `\nBegin by examining Item 1. Review the file, make the surgical fix, run verification, and proceed through the list.`
+  return body
+}
+
+async function processBatchAgentForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  const startConfig = await getStartConfig()
+  addLog(`[${label}] Discovering target repositories for Batch Agent...`)
+  const repos = await safeListSources(label, config, true)
+  if (!repos) return 0
+
+  let targetRepos = repos
+  if (options.repoFilter && options.repoFilter !== '__ALL__') {
+    const filterLower = options.repoFilter.toLowerCase().trim()
+    targetRepos = repos.filter(r => r.toLowerCase().includes(filterLower))
+    if (targetRepos.length === 0) {
+      targetRepos = [options.repoFilter.startsWith('github/') ? options.repoFilter : `github/${options.repoFilter}`]
+    }
+  }
+
+  addLog(`[${label}] Querying suggestions across ${targetRepos.length} repo(s)...`)
+  let totalTasksLaunched = 0
+
+  for (const repo of targetRepos) {
+    if (state.status === 'cancelled') break
+    const suggestions = await listSuggestions(repo, config)
+    if (!suggestions || suggestions.length === 0) {
+      addLog(`[${label}] ${repo}: 0 suggestions. Skipping agent launch.`)
+      continue
+    }
+
+    addLog(`[${label}] ${repo}: Assembling ${suggestions.length} suggestions into 1 Unified Master Agent task...`)
+    const batchPrompt = buildBatchAgentPrompt(suggestions, repo)
+
+    if (options.dryRun) {
+      addLog(`  [DRY] Would launch 1 Master Agent on ${repo} handling all ${suggestions.length} items.`)
+      continue
+    }
+
+    // Launch single task session via Rja83d with first suggestion metadata
+    const modelId = config.modelId || startConfig?.modelConfig?.[1] || null
+    const featureFlags = startConfig?.featureFlags || DEFAULT_FEATURE_FLAGS
+    const experimentIds = startConfig?.experimentIds || []
+
+    const payload = new Array(15).fill(null)
+    payload[RJA83D.PROMPT] = batchPrompt
+    payload[RJA83D.MODEL_CONFIG] = buildModelConfig(modelId, featureFlags)
+    payload[RJA83D.REPO] = repo
+    payload[RJA83D.METADATA] = buildSuggestionMetadata(suggestions[0].id, experimentIds)
+    payload[RJA83D.START_FLAG] = 1
+
+    try {
+      await withRetry(() => callBatchExecute('Rja83d', payload, config))
+      totalTasksLaunched++
+      addLog(`  🚀 Successfully launched Unified Agent for ${repo} with all ${suggestions.length} suggestions!`)
+      if (chrome.notifications) {
+        chrome.notifications.create({
+          type: 'basic',
+          iconUrl: 'icons/icon128.png',
+          title: 'Jules Master Agent Dispatched',
+          message: `Dispatched single agent covering ${suggestions.length} suggestions on ${repo.replace(/^github\//, '')}`
+        })
+      }
+    } catch (err) {
+      addLog(`  [!] Failed to launch batch agent on ${repo}: ${err.message}`)
+    }
+  }
+
+  return totalTasksLaunched
+}
+
+async function processExportSuggestionsForTab(tab, options) {
+  const prepared = await prepareTab(tab)
+  if (!prepared) return 0
+  const { label, config } = prepared
+
+  addLog(`[${label}] Discovering all connected repositories...`)
+  // Allow all repositories, not just the 5 toggle-enabled ones!
+  const repos = await safeListSources(label, config, true)
+  if (!repos) return 0
+
+  let filteredRepos = repos
+  if (options.repoFilter && options.repoFilter !== '__ALL__') {
+    const filterLower = options.repoFilter.toLowerCase().trim()
+    filteredRepos = repos.filter((r) => {
+      const full = r.toLowerCase()
+      const display = r.replace(/^github\//, '').toLowerCase()
+      return full.includes(filterLower) || display.includes(filterLower)
+    })
+    if (filteredRepos.length === 0) {
+      // Fallback: If not found in returned list, query directly by user-specified ID!
+      const explicitRepo = options.repoFilter.startsWith('github/') ? options.repoFilter : `github/${options.repoFilter}`
+      filteredRepos = [explicitRepo]
+      addLog(`[${label}] Using specified repository directly: ${explicitRepo}`)
+    } else {
+      addLog(`[${label}] Selected repository: ${options.repoFilter}`)
+    }
+  } else {
+    addLog(`[${label}] Checking all ${filteredRepos.length} connected repositories...`)
+  }
+
+  addLog(`[${label}] Querying suggestions for ${filteredRepos.length} repo(s)...`)
+  const allSuggestions = await runInPool(filteredRepos, PER_ACCOUNT_CONCURRENCY, (repo) =>
+    globalLimit(() => listSuggestions(repo, config))
+      .then((suggestions) => ({ repo, suggestions }))
+      .catch((e) => ({ repo, error: e.message }))
+  )
+
+  const exportResults = []
+  let totalFound = 0
+  for (const { repo, suggestions, error } of allSuggestions) {
+    if (error) {
+      addLog(`[${label}] ERROR fetching suggestions for ${repo}: ${error}`)
+      continue
+    }
+    if (suggestions && suggestions.length > 0) {
+      addLog(`[${label}] ${repo}: Found ${suggestions.length} suggestions`)
+      totalFound += suggestions.length
+      exportResults.push({ repo, suggestions })
+    } else {
+      addLog(`[${label}] ${repo}: 0 suggestions`)
+    }
+  }
+
+  const exportPayload = {
+    exportedAt: new Date().toISOString(),
+    account: label,
+    totalSuggestions: totalFound,
+    repositories: exportResults
+  }
+
+  state.exportData = exportPayload
+  updateState({ exportData: exportPayload })
+  persistNow()
+
+  // Clean, single download trigger from background worker
+  try {
+    if (chrome.downloads && typeof chrome.downloads.download === 'function') {
+      const jsonStr = JSON.stringify(exportPayload, null, 2)
+      const dataUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(jsonStr)
+      const filename = `jules-suggestions-${new Date().toISOString().slice(0, 10)}.json`
+      chrome.downloads.download({
+        url: dataUrl,
+        filename: filename,
+        saveAs: false
+      }, (downloadId) => {
+        if (!chrome.runtime.lastError && downloadId) {
+          addLog(`[${label}] Export saved: ${filename}`)
+          if (chrome.notifications) {
+            chrome.notifications.create({
+              type: 'basic',
+              iconUrl: 'icons/icon128.png',
+              title: 'Jules Suggestions Exported',
+              message: `Successfully saved ${totalFound} suggestions to ${filename}`
+            })
+          }
+        }
+      })
+    }
+  } catch (err) {
+    console.error('Background download error:', err)
+  }
+  addLog(`\n[${label}] TOTAL: Successfully extracted ${totalFound} suggestions across ${exportResults.length} repo(s)!`)
+  return totalFound
 }
 
 async function discoverTabs(options) {
@@ -1330,6 +1544,10 @@ async function processAllTabs(tabs, options) {
           count = await processSuggestionsForTab(tab, options)
         } else if (options.opMode === 'remove_suggestions') {
           count = await processRemoveSuggestionsForTab(tab, options)
+        } else if (options.opMode === 'export_suggestions') {
+          count = await processExportSuggestionsForTab(tab, options)
+        } else if (options.opMode === 'agent_batch') {
+          count = await processBatchAgentForTab(tab, options)
         } else {
           count = await processTab(tab, options)
         }
@@ -1352,6 +1570,12 @@ function finalizeOperation(results, optionsOrIsSuggestions) {
     } else if (optionsOrIsSuggestions.opMode === 'remove_suggestions') {
       verb = 'removed'
       itemLabel = 'suggestions'
+    } else if (optionsOrIsSuggestions.opMode === 'export_suggestions') {
+      verb = 'exported'
+      itemLabel = 'suggestions'
+    } else if (optionsOrIsSuggestions.opMode === 'agent_batch') {
+      verb = 'launched'
+      itemLabel = 'master agent sessions'
     }
   } else if (optionsOrIsSuggestions) {
     verb = 'started'
@@ -1398,6 +1622,25 @@ async function startOperation(options) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.action) {
+    case 'GET_ALL_SOURCES': {
+      (async () => {
+        try {
+          const tabs = await getJulesTabs()
+          if (!tabs.length) {
+            sendResponse({ repos: [] })
+            return
+          }
+          const config = await getTabConfig(tabs[0].id)
+          const allRepos = await listAllSources(config)
+          const displayNames = allRepos.map(r => r.replace(/^github\//, '')).sort()
+          sendResponse({ repos: displayNames })
+        } catch (err) {
+          console.error('Failed to query all sources:', err)
+          sendResponse({ repos: [], error: err.message })
+        }
+      })()
+      return true
+    }
     case 'START':
       if (_sender.tab) {
         sendResponse({ error: 'Security Error: Unauthorized action from content script' })

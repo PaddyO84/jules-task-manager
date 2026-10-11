@@ -4,6 +4,8 @@
   "version": "2.5",
   "description": "Bulk archive tasks, start code suggestions, and remove suggestions on Jules via batchexecute API",
   "permissions": [
+    "downloads",
+    "notifications",
     "storage",
     "tabs",
     "scripting",

@@ -38,8 +38,10 @@
         <legend id="opModeLabel">Operation</legend>
         <div class="segmented" id="opMode">
           <button type="button" data-value="archive" class="active" aria-pressed="true">Archive Tasks</button>
-          <button type="button" data-value="suggestions" aria-pressed="false">Start Suggestions</button>
-          <button type="button" data-value="remove_suggestions" aria-pressed="false">Remove Suggestions</button>
+          <button type="button" data-value="suggestions" aria-pressed="false">Start (Separate)</button>
+          <button type="button" data-value="agent_batch" aria-pressed="false">Batch to 1 Agent</button>
+          <button type="button" data-value="remove_suggestions" aria-pressed="false">Remove</button>
+          <button type="button" data-value="export_suggestions" aria-pressed="false">Export JSON</button>
         </div>
       </fieldset>
     </div>
@@ -54,12 +56,13 @@
     </div>
     <div class="setting-row">
       <label for="repoFilter">
-        Repository Filter <span class="hint" id="repoFilterHint">(select codebase or all)</span>
+        Repository Filter <span class="hint" id="repoFilterHint">(select from list or type below)</span>
         <select id="repoFilter" aria-describedby="repoFilterHint">
           <option value="" selected>Choose a Repo</option>
           <option value="__ALL__">All Repositories</option>
         </select>
       </label>
+      <input type="text" id="customRepoInput" placeholder="Or enter owner/repo (e.g. PaddyO84/HouslyPro)" style="margin-top: 6px; font-size: 12px;" />
     </div>
   </section>
 
@@ -67,6 +70,7 @@
 
   <button type="button" id="startBtn" class="primary" disabled>Start Archiving</button>
   <button type="button" id="resetBtn" class="secondary" style="display: none">Clear Log</button>
+  <button type="button" id="downloadBtn" class="primary" style="display: none; background: #10b981; margin-top: 8px;">⬇ Download Suggestions JSON</button>
 
   <section id="progressSection" style="display: none">
     <h2>Progress</h2>

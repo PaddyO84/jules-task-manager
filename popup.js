@@ -9,8 +9,10 @@ const $ = (sel) => document.querySelector(sel)
 
 // --- DOM refs ---
 const repoFilterInput = $('#repoFilter')
+const customRepoInput = $('#customRepoInput')
 const startBtn = $('#startBtn')
 const resetBtn = $('#resetBtn')
+const downloadBtn = $('#downloadBtn')
 const progressSection = $('#progressSection')
 const summarySection = $('#summarySection')
 const currentInfo = $('#currentInfo')
@@ -29,6 +31,10 @@ function getRunningText() {
     return isDry ? '⏳ Dry Running Archive...' : '⏳ Running Archive...'
   } else if (opMode === 'remove_suggestions') {
     return isDry ? '⏳ Dry Running Remove Suggestions...' : '⏳ Running Remove Suggestions...'
+  } else if (opMode === 'export_suggestions') {
+    return '⏳ Exporting Suggestions to JSON...'
+  } else if (opMode === 'agent_batch') {
+    return isDry ? '⏳ Dry Running Batch Agent...' : '⏳ Launching Single Agent for All Suggestions...'
   } else {
     return isDry ? '⏳ Dry Running Suggestions...' : '⏳ Running Suggestions...'
   }
@@ -58,6 +64,8 @@ function updateStartButtonText() {
     startBtn.textContent = isDry ? 'Dry Run Archive' : 'Start Archiving'
   } else if (opMode === 'remove_suggestions') {
     startBtn.textContent = isDry ? 'Dry Run Remove Suggestions' : 'Remove Suggestions'
+  } else if (opMode === 'export_suggestions') {
+    startBtn.textContent = 'Export Suggestions JSON'
   } else {
     startBtn.textContent = isDry ? 'Dry Run Suggestions' : 'Start Suggestions'
   }
@@ -65,7 +73,7 @@ function updateStartButtonText() {
 
 function updateStartBtnState() {
   if (startBtn.getAttribute('aria-busy') === 'true') return
-  const hasSelection = Boolean(repoFilterInput.value)
+  const hasSelection = Boolean(repoFilterInput.value || (customRepoInput && customRepoInput.value.trim()))
   startBtn.disabled = !hasSelection
   updateStartButtonText()
 }
@@ -121,17 +129,26 @@ const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 1000
 
 async function populateCodebases(attempt = 0) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-  if (!tab?.id) return
-
-  chrome.tabs.sendMessage(tab.id, { action: 'GET_CODEBASES' }, (response) => {
-    if (chrome.runtime.lastError || !response?.codebases?.length) {
-      if (attempt < MAX_RETRIES) {
-        setTimeout(() => populateCodebases(attempt + 1), RETRY_DELAY_MS)
-      }
+  // Query background for all connected sources via Jules API first
+  chrome.runtime.sendMessage({ action: 'GET_ALL_SOURCES' }, (bgResp) => {
+    if (bgResp?.repos && bgResp.repos.length > 0) {
+      applyCodebases(bgResp.repos)
       return
     }
-    applyCodebases(response.codebases)
+
+    // Fallback to DOM elements on current page if background fetch hasn't completed
+    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+      if (!tab?.id) return
+      chrome.tabs.sendMessage(tab.id, { action: 'GET_CODEBASES' }, (response) => {
+        if (chrome.runtime.lastError || !response?.codebases?.length) {
+          if (attempt < MAX_RETRIES) {
+            setTimeout(() => populateCodebases(attempt + 1), RETRY_DELAY_MS)
+          }
+          return
+        }
+        applyCodebases(response.codebases)
+      })
+    })
   })
 }
 
@@ -140,14 +157,26 @@ updateStartBtnState()
 
 // --- Update start button on repo selection change ---
 repoFilterInput.addEventListener('change', () => {
+  if (repoFilterInput.value && customRepoInput) customRepoInput.value = ''
   updateStartBtnState()
 })
 
+if (customRepoInput) {
+  customRepoInput.addEventListener('input', () => {
+    if (customRepoInput.value.trim()) {
+      repoFilterInput.value = ''
+    }
+    updateStartBtnState()
+  })
+}
+
+
 // --- Start operation ---
 startBtn.addEventListener('click', async () => {
-  const selected = repoFilterInput.value
+  const customVal = customRepoInput ? customRepoInput.value.trim() : ''
+  const selected = customVal || repoFilterInput.value
   if (!selected) {
-    return // Non-functional if "Choose a Repo" is selected
+    return // Non-functional if nothing selected or typed
   }
 
   const mode = document.querySelector('input[name="mode"]:checked').value
@@ -189,6 +218,7 @@ resetBtn.addEventListener('click', () => {
   resetBtn.style.display = 'none'
   progressSection.style.display = 'none'
   summarySection.style.display = 'none'
+  if (downloadBtn) downloadBtn.style.display = 'none'
   repoFilterInput.value = ''
   updateStartBtnState()
   // Move focus back to the primary action so keyboard users are not stranded
@@ -239,6 +269,13 @@ function renderState(state) {
     if (state.status === 'done') {
       currentInfo.textContent = 'Complete'
       renderSummary(state.results)
+      if (state.exportData) {
+        lastExportData = state.exportData
+        if (downloadBtn) {
+          downloadBtn.style.display = 'block'
+          downloadBtn.textContent = `⬇ Download Suggestions JSON (${state.exportData.totalSuggestions || 0} found)`
+        }
+      }
     } else {
       currentInfo.textContent = `Error: ${state.error}`
       progressFill.style.background = '#f87171'
@@ -306,3 +343,34 @@ chrome.runtime.sendMessage({ action: 'GET_STATE' }, (state) => {
     updateStartBtnState()
   }
 })
+
+let lastExportData = null
+
+if (downloadBtn) {
+  downloadBtn.addEventListener('click', () => {
+    if (lastExportData) {
+      downloadExportedSuggestions(lastExportData)
+    }
+  })
+}
+
+function downloadExportedSuggestions(exportData) {
+  try {
+    const filename = `jules-suggestions-${new Date().toISOString().slice(0, 10)}.json`
+    const jsonStr = JSON.stringify(exportData, null, 2)
+    const blob = new Blob([jsonStr], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    setTimeout(() => {
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    }, 1000)
+    console.log('Download initiated for', filename)
+  } catch (err) {
+    console.error('Failed to trigger JSON download:', err)
+  }
+}
